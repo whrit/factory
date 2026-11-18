@@ -29,6 +29,7 @@ COMMANDS = {
     "mcp": ("mcp", "main", "serve registered repositories' evidence reads to a stdio MCP client"),
     "plan": ("plan", "main", "read initiatives: `plan list`, `plan inspect N`, `plan baseline N`, `plan drift TICKET`, `plan route N --reason R` (JSON)"),
     "codebase": ("codebase", "main", "build commit-pinned codebase history for the dashboard"),
+    "linear-sync": ("linear", "main", "copy Linear issues to the GitHub repo their area:* label maps to"),
 }
 
 
