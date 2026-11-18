@@ -130,7 +130,7 @@ def failed_units(cfg: config.Config) -> list[tuple[str, str]]:
             capture_output=True, text=True, check=False,
         ).stdout
     except OSError:
-        return []
+        listed = ""  # no systemd (macOS launchd): only this pass's own $SERVICE_RESULT below
     names = [line.split()[0] for line in listed.splitlines() if line.split()]
     result = os.environ.get("SERVICE_RESULT")
     own = ""
@@ -141,10 +141,15 @@ def failed_units(cfg: config.Config) -> list[tuple[str, str]]:
     units = []
     for name in names:
         if name in (f"{cfg.unit}.service", f"{cfg.unit}-dashboard.service"):
-            status = subprocess.run(["systemctl", "--user", "status", "--no-pager", "-n", "20", name],
-                                    capture_output=True, text=True, check=False)
+            try:
+                status = subprocess.run(["systemctl", "--user", "status", "--no-pager", "-n", "20", name],
+                                        capture_output=True, text=True, check=False)
+                detail = status.stdout + status.stderr
+            except OSError:
+                log = config.launchd_log(name.removesuffix(".service"))
+                detail = "\n".join(log.read_text(errors="replace").splitlines()[-20:]) if log.exists() else ""
             prefix = own if name == f"{cfg.unit}.service" else ""
-            units.append((name, (prefix + status.stdout + status.stderr).strip()))
+            units.append((name, (prefix + detail).strip()))
     return units
 
 

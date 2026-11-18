@@ -14,7 +14,9 @@ import re
 import shlex
 import shutil
 import socket
+import plistlib
 import subprocess
+import time
 import sys
 import urllib.request
 from pathlib import Path
@@ -210,7 +212,7 @@ def init(argv: list[str]) -> int:
         f"     and the same commands in {CI_WORKFLOW} (the merge stage needs a passing check)\n"
         f"  2. git add {CONFIG_NAME} {BANDS_NAME} .gitignore {ISSUE_TEMPLATE.parent} {WORKFLOWS} && git commit\n"
         "  3. factory doctor\n"
-        "  4. factory install --dashboard   # systemd user timer, every 10 min"
+        f"  4. factory install --dashboard   # {'systemd user timer' if shutil.which('systemctl') else 'launchd agent'}, every 10 min"
     )
     return 0
 
@@ -711,7 +713,13 @@ def doctor(argv: list[str]) -> int:
 
     timer = timer_state(f"{cfg.unit}.timer")
     if timer is None:
-        report(None, f"systemd timer {cfg.unit}.timer", "n/a (launchd)", info=True)
+        # No systemd: report the LaunchAgent that `factory install` writes on macOS.
+        loaded = launchd_loaded(cfg.unit) if shutil.which("systemctl") is None else None
+        if loaded is None:
+            report(None, f"systemd timer {cfg.unit}.timer", "n/a (launchd)", info=True)
+        else:
+            report(True if loaded else None, f"launchd agent {cfg.unit}",
+                   "loaded" if loaded else "not installed (factory install)")
     else:
         report(True if timer == "active" else None, f"systemd timer {cfg.unit}.timer", timer or "not installed (factory install)")
     if cfg.triage_service:
@@ -826,17 +834,21 @@ def interpreter_probe(cfg: config.Config) -> tuple[bool, str]:
     if not os.access(python, os.X_OK):
         return False, f"{python} is not executable"
 
+    env = {}
     command = "systemctl --user show-environment"
-    try:
-        manager = sh(["systemctl", "--user", "show-environment"])
-    except (OSError, UnicodeError) as exc:
-        return False, f"{command} failed: {exc}; check the user systemd manager"
+    if shutil.which("systemctl") is None:
+        # launchd starts agents with a bare environment; the plist adds PATH and [install].env.
+        manager = subprocess.CompletedProcess([], 0, "", "")
+    else:
+        try:
+            manager = sh(["systemctl", "--user", "show-environment"])
+        except (OSError, UnicodeError) as exc:
+            return False, f"{command} failed: {exc}; check the user systemd manager"
     if manager.returncode:
         return False, (
             f"{command} failed: {manager.stderr.strip() or manager.returncode}; "
             "check the user systemd manager"
         )
-    env = {}
     lines = manager.stdout.removesuffix("\n").split("\n") if manager.stdout else []
     for number, line in enumerate(lines, 1):
         try:
@@ -999,6 +1011,170 @@ def units(cfg: config.Config, every: str, host: str) -> dict[str, str]:
     return result
 
 
+# ---------------------------------------------------------------- launchd (macOS)
+
+# One pass with the systemd unit's semantics: drain-check gates the pass (ExecCondition),
+# triage may fail (`-`), dispatch decides the result, watch always runs with $SERVICE_RESULT
+# (ExecStopPost). `$0` is the service interpreter, passed as an argument so nothing is re-quoted.
+PASS_SCRIPT = """\
+"$0" -P -m factory drain-check
+status=$?
+if [ "$status" -ne 0 ]; then
+  result=exec-condition
+  status=0
+else
+  "$0" -P -m factory triage
+  "$0" -P -m factory dispatch
+  status=$?
+  if [ "$status" -eq 0 ]; then result=success; else result=exit-code; fi
+fi
+SERVICE_RESULT=$result EXIT_CODE=exited EXIT_STATUS=$status "$0" -P -m factory watch
+exit "$status"
+"""
+
+_SPAN_UNITS = {
+    "": 1, "s": 1, "sec": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400, "w": 604800, "week": 604800, "weeks": 604800,
+}
+
+
+def span_seconds(value: str) -> int:
+    """A systemd time span (`10min`, `1h 30min`, `90`) in seconds, for launchd StartInterval."""
+    text = str(value).strip().lower()
+    parts = re.findall(r"(\d+)\s*([a-z]*)", text)
+    if not parts or re.sub(r"\d+\s*[a-z]*", "", text).strip() or any(u not in _SPAN_UNITS for _, u in parts):
+        raise ConfigError(f"interval {value!r} is not a time span such as 10min or 1h")
+    total = sum(int(n) * _SPAN_UNITS[u] for n, u in parts)
+    if total <= 0:
+        raise ConfigError(f"interval {value!r} must be positive")
+    return total
+
+
+def launch_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def launchd_loaded(label: str) -> bool | None:
+    """Whether the agent is loaded; None when this host has no launchctl."""
+    if shutil.which("launchctl") is None:
+        return None
+    return sh(["launchctl", "print", f"{launchd_domain()}/{label}"]).returncode == 0
+
+
+def launchd_jobs(cfg: config.Config, every: str, host: str) -> dict[str, dict]:
+    """LaunchAgent plists by label: the pass, the dashboard, and the weekly eval when scheduled."""
+    python = str(service_python(cfg))
+    # launchd agents start with a minimal PATH; carry the installing shell's, as the systemd units do.
+    env = {"PATH": os.environ["PATH"], **cfg.install["env"]}
+    dispatch_env = {**env, **cfg.install.get("dispatch_env", {})}
+
+    def job(label: str, arguments: list[str], environment: dict, **extra: object) -> dict:
+        log = str(config.launchd_log(label))
+        return {"Label": label, "ProgramArguments": arguments, "WorkingDirectory": str(cfg.root),
+                "EnvironmentVariables": environment, "StandardOutPath": log, "StandardErrorPath": log, **extra}
+
+    jobs = {
+        cfg.unit: job(cfg.unit, ["/bin/sh", "-c", PASS_SCRIPT, python], dispatch_env,
+                      StartInterval=span_seconds(every)),
+        f"{cfg.unit}-dashboard": job(
+            f"{cfg.unit}-dashboard",
+            [python, "-P", "-m", "factory", "dashboard", "--host", host, "--port", str(cfg.dashboard_port), "--no-open"],
+            env, RunAtLoad=True, KeepAlive={"SuccessfulExit": False},
+        ),
+    }
+    if cfg.eval_schedule:
+        jobs[f"{cfg.unit}-eval"] = job(
+            f"{cfg.unit}-eval",
+            [python, "-P", "-m", "factory", "eval", "--profile", cfg.eval_profile, "--scheduled"],
+            env, StartCalendarInterval={"Weekday": 1, "Hour": 3, "Minute": 0},
+        )
+    return jobs
+
+
+def launchctl(*args: str) -> None:
+    proc = sh(["launchctl", *args])
+    if proc.returncode != 0:
+        raise ConfigError(f"launchctl {' '.join(args)}: {proc.stderr.strip() or proc.stdout.strip() or proc.returncode}")
+
+
+def _bootstrap(domain: str, path: Path) -> None:
+    # `bootout` returns before launchd finishes unloading; a bootstrap right after can fail with EIO.
+    for attempt in range(10):
+        proc = sh(["launchctl", "bootstrap", domain, str(path)])
+        if proc.returncode == 0:
+            return
+        time.sleep(0.5)
+    raise ConfigError(f"launchctl bootstrap {domain} {path}: {proc.stderr.strip() or proc.returncode}")
+
+
+def install_launchd(cfg: config.Config, args: argparse.Namespace) -> int:
+    """`factory install` on macOS: LaunchAgents with the systemd units' activation semantics."""
+    jobs = launchd_jobs(cfg, args.every, args.host)
+    dash = f"{cfg.unit}-dashboard"
+    if not args.dashboard:
+        jobs.pop(dash)
+    if args.print:
+        for label, job in jobs.items():
+            print(f"# {label}.plist\n{plistlib.dumps(job).decode()}")
+        return 0
+    if cfg.install.get("python") is not None:
+        ok, detail = interpreter_probe(cfg)
+        if not ok:
+            raise ConfigError(f"service interpreter: {detail}")
+        print(f"validated service interpreter: {detail}")
+    if args.dashboard:
+        port_ok, port_detail = _dashboard_port_check(cfg, args.host, cfg.dashboard_port)
+        if not port_ok:
+            print(port_detail, file=sys.stderr)
+            return 1
+    if cfg.triage_service:
+        print(f"skipped triage-probe: [triage].service ({cfg.triage_service}) is a systemd unit")
+
+    domain = launchd_domain()
+    disabled = sh(["launchctl", "print-disabled", domain]).stdout
+    agents = launch_agents_dir()
+    # Snapshot every job before writing, as the systemd path does.
+    prior = {label: ((agents / f"{label}.plist").exists(), launchd_loaded(label),
+                     re.search(rf'"{re.escape(label)}"\s*=>\s*(?:disabled|true)\b', disabled) is not None)
+             for label in jobs}
+    agents.mkdir(parents=True, exist_ok=True)
+    config.launchd_log(cfg.unit).parent.mkdir(parents=True, exist_ok=True)
+    for label in (dash, f"{cfg.unit}-eval"):
+        path = agents / f"{label}.plist"
+        if label not in jobs and path.exists():
+            sh(["launchctl", "bootout", f"{domain}/{label}"])
+            path.unlink()
+            print(f"removed {path}")
+    for label, job in jobs.items():
+        path = agents / f"{label}.plist"
+        body = plistlib.dumps(job)
+        existed, loaded, was_disabled = prior[label]
+        changed = existed and path.read_bytes() != body
+        if not existed or changed:
+            path.write_bytes(body)
+            print(f"wrote {path}")
+        if existed and not args.enable and (was_disabled or not loaded):
+            print(f"left paused {label}; resume with: launchctl enable {domain}/{label} && "
+                  f"launchctl bootstrap {domain} {path} (or rerun factory install --enable)")
+            continue
+        launchctl("enable", f"{domain}/{label}")
+        if loaded and changed:
+            sh(["launchctl", "bootout", f"{domain}/{label}"])
+        if not loaded or changed:
+            _bootstrap(domain, path)
+        print(f"{'restarted' if loaded and changed else 'started' if not loaded else 'unchanged'} {label}")
+    print(f"logs: {config.launchd_log(cfg.unit).parent}")
+    print("note: LaunchAgents run while you are logged in; a sleeping Mac runs missed passes on wake")
+    print(f"stop with: {' && '.join(f'launchctl bootout {domain}/{label}' for label in jobs)}")
+    return 0
+
+
 def _ss_failure(exc: OSError) -> str:
     """Reason for a dashboard-port row when `ss` could not run (defined below the doctor rows so their line numbers stay put)."""
     if isinstance(exc, FileNotFoundError) and platform_identity.darwin():
@@ -1016,7 +1192,7 @@ def systemctl(*args: str) -> None:
 def install(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="factory install",
-        description="Install systemd user units: a dispatcher timer and, optionally, the dashboard. "
+        description="Install systemd user units (Linux) or LaunchAgents (macOS): a dispatcher timer and, optionally, the dashboard. "
         "Defaults come from [install] in the host config; [install].python selects the service "
         "interpreter. --print only renders units and does not validate the interpreter.",
     )
@@ -1036,6 +1212,8 @@ def install(argv: list[str]) -> int:
     cfg = config.load()
     parser.set_defaults(**{k: cfg.install[k] for k in ("every", "dashboard", "host")})
     args = parser.parse_args(argv)
+    if shutil.which("systemctl") is None and shutil.which("launchctl") is not None:
+        return install_launchd(cfg, args)
 
     wanted = units(cfg, args.every, args.host)
     dash_unit = f"{cfg.unit}-dashboard.service"

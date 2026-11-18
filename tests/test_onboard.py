@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -259,7 +260,9 @@ class DoctorTimerTest(unittest.TestCase):
         for service in ("", "model.service"):
             with self.subTest(service=service):
                 output, calls = self.doctor(None, service=service)
-                self.assertIn("  INFO  systemd timer factory-widgets.timer: n/a (launchd)\n", output)
+                # macOS: doctor reports the LaunchAgent `factory install` writes (launchctl stub loaded it).
+                self.assertIn("  PASS  launchd agent factory-widgets: loaded\n", output)
+                self.assertIn(["launchctl", "print", f"gui/{os.getuid()}/factory-widgets"], calls)
                 self.assertIn(
                     "  INFO  triage liveness probe: " + (
                         "n/a (launchd)" if service else

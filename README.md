@@ -58,7 +58,7 @@ factory init            # .factory.toml, .gitignore, issue template, labels
 $EDITOR .factory.toml   # put your real test/lint commands in [[gate.check]]
 git add .factory.toml .gitignore .github/ISSUE_TEMPLATE && git commit
 factory doctor          # tools, auth, remotes, model, dashboard port and .factory safety
-factory install --dashboard   # systemd user timer every 10 min + dashboard on :8765
+factory install --dashboard   # every 10 min + dashboard on :8765 (systemd on Linux, launchd on macOS)
 ```
 
 `factory install` enables and starts new units. On reinstall it snapshots each
@@ -72,6 +72,23 @@ explicitly enable and start all installed units.
 If `is-enabled` fails without stdout (as on older systemd versions), install
 checks `LoadState` to confirm a missing unit. An inconclusive query aborts before
 unit files are changed, rather than treating a query failure as a fresh install.
+
+**macOS.** Without `systemctl`, `factory install` writes LaunchAgents to
+`~/Library/LaunchAgents/factory-<repo>.plist` (plus `-dashboard` and, with an
+`[eval].schedule`, a weekly `-eval`) and loads them with `launchctl bootstrap
+gui/<uid>`. The pass agent runs the same sequence as the systemd unit every
+`--every` (a systemd time span such as `10min`): `drain-check` gates the pass,
+`triage` may fail, `dispatch` sets the result, and `watch` always runs with
+`SERVICE_RESULT`/`EXIT_STATUS` so a failed pass files itself. The dashboard
+agent restarts on failure. `[install].env` and the installing shell's `PATH`
+go into every agent and `[install].dispatch_env` only into the pass, as on
+Linux. Logs go to `~/Library/Logs/factory/<label>.log`, which `watch` reads in
+place of `systemctl status`. Reinstall keeps the same activation rules: an
+existing agent that is disabled or not loaded stays paused unless `--enable`;
+a changed, loaded agent is reloaded. `--print` renders the plists.
+`[triage].service` names a systemd unit, so the triage probe agent is skipped.
+LaunchAgents run only while you are logged in; a pass missed during sleep runs
+on wake. `doctor` reports `launchd agent factory-<repo>: loaded`.
 
 `doctor` checks the configured dashboard bind address and port; `install --dashboard`
 refuses a foreign or unidentified holder before writing units. Each factory needs

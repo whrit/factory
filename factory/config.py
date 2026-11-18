@@ -401,15 +401,29 @@ def git(root: Path | None, *args: str) -> str:
 
 def repo_root(start: Path | None = None) -> Path:
     """Main checkout root, even when called from inside one of its worktrees."""
-    common = git(start, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    return Path(common).parent
+    common = Path(git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    if common.name == ".git":
+        return common.parent
+    # Submodule (`.git/modules/<path>`) or separate git dir: git resolves its core.worktree.
+    return Path(git(None, f"--git-dir={common}", "rev-parse", "--show-toplevel"))
+
+
+# Owner/name after the github.com host, tolerating SSH config aliases such as
+# `git@github.com-work:owner/name.git` and `ssh://git@github.com-work/owner/name.git`.
+_GITHUB_SLUG = re.compile(r"github\.com[^:/]*[:/]+([^/]+/[^/]+?)(?:\.git)?/*$")
 
 
 def remote_slug(root: Path, remote: str) -> str:
     url = git(root, "remote", "get-url", remote)
-    if "github.com" not in url:
+    match = _GITHUB_SLUG.search(url)
+    if match is None:
         raise ConfigError(f"remote `{remote}` ({url}) is not on github.com; set [repo].slug")
-    return url.rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
+    return match[1]
+
+
+def launchd_log(job: str) -> Path:
+    """macOS LaunchAgent stdout/stderr for one job stem (`factory-<repo>`, `-dashboard`, `-eval`)."""
+    return Path.home() / "Library" / "Logs" / "factory" / f"{job}.log"
 
 
 def host_config_path() -> Path:
