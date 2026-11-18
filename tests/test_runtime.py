@@ -36,8 +36,8 @@ def audit(event, args):
         argv = args[1]
         commands.append(argv)
         tool = os.path.basename(argv[0])
-        if not (tool == "systemctl" or tool == "git" and
-                ("rev-parse" in argv or "get-url" in argv)):
+        if not (tool == "systemctl" or tool == "launchctl" and argv[1:2] == ["print"]
+                or tool == "git" and ("rev-parse" in argv or "get-url" in argv)):
             attempts.append(argv)
             raise AssertionError("external command forbidden")
 sys.addaudithook(audit)

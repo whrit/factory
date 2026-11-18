@@ -403,6 +403,8 @@ def _dashboard_port_check(cfg: config.Config, host: str, port: int) -> tuple[boo
         # (A `0.0.0.0` host collides with its own held probe and stays closed.)
         if not collision and platform_identity.darwin():
             return True, f"available on {host}"
+        if collision and platform_identity.darwin() and (owned := _launchd_dashboard_holder(cfg, port)):
+            return True, owned
 
         # Keep a free probe held through `ss`; the later install-to-service bind
         # remains inherently racy. A collision that vanishes here fails closed.
@@ -449,6 +451,22 @@ def _dashboard_port_check(cfg: config.Config, host: str, port: int) -> tuple[boo
         names = ", ".join(dict.fromkeys(foreign or (name for name, _ in holders)))
         return False, dashboard_port_error(cfg, host, port, f"is in use by {names}")
     return True, f"owned by {unit} (pid {main_pid})"
+
+
+def _launchd_dashboard_holder(cfg: config.Config, port: int) -> str | None:
+    """macOS: this repository's dashboard LaunchAgent is the only listener on `port`."""
+    label = f"{cfg.unit}-dashboard"
+    try:
+        if shutil.which("launchctl") is None:
+            return None
+        agent = re.search(r"^\tpid = (\d+)$", sh(["launchctl", "print", f"{launchd_domain()}/{label}"]).stdout,
+                          re.MULTILINE)
+        if agent is None:
+            return None
+        listeners = set(sh(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"]).stdout.split())
+    except OSError:
+        return None
+    return f"owned by {label} (pid {agent[1]})" if listeners == {agent[1]} else None
 
 
 def report_stage_success(cfg: config.Config, report) -> None:
@@ -696,12 +714,19 @@ def doctor(argv: list[str]) -> int:
 
     from factory import triage
 
-    alive, detail = triage.probe_endpoint(cfg, opener=urllib.request.urlopen)
-    report(
-        True if alive else None,
-        "triage model endpoint",
-        f"{cfg.llm_url} ({detail})" if alive else f"{cfg.llm_url} ({detail}); `factory triage` will not run",
-    )
+    if cfg.triage_command:
+        # Hosted CLI: presence only; a doctor run must not spend a model call.
+        found = shutil.which(cfg.triage_command[0])
+        report(True if found else None, "triage command",
+               f"{' '.join(cfg.triage_command)} ({found})" if found
+               else f"{cfg.triage_command[0]} not found on PATH; `factory triage` will not run")
+    else:
+        alive, detail = triage.probe_endpoint(cfg, opener=urllib.request.urlopen)
+        report(
+            True if alive else None,
+            "triage model endpoint",
+            f"{cfg.llm_url} ({detail})" if alive else f"{cfg.llm_url} ({detail}); `factory triage` will not run",
+        )
 
     def timer_state(unit: str) -> str | None:
         if shutil.which("systemctl") is None:
@@ -1081,7 +1106,7 @@ def launchd_jobs(cfg: config.Config, every: str, host: str) -> dict[str, dict]:
 
     jobs = {
         cfg.unit: job(cfg.unit, ["/bin/sh", "-c", PASS_SCRIPT, python], dispatch_env,
-                      StartInterval=span_seconds(every)),
+                      StartInterval=span_seconds(every), RunAtLoad=True),
         f"{cfg.unit}-dashboard": job(
             f"{cfg.unit}-dashboard",
             [python, "-P", "-m", "factory", "dashboard", "--host", host, "--port", str(cfg.dashboard_port), "--no-open"],

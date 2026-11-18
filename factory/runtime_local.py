@@ -12,6 +12,7 @@ import json
 import os
 import re
 import selectors
+import shutil
 import stat
 import subprocess
 import time
@@ -61,9 +62,14 @@ def _read(path: Path, limit: int, *, kernel: bool = False) -> bytes:
 def _command(operation: str, *, root: Path | None = None, unit: str = "") -> str:
     """Only the fixed local queries below may be executed; stderr is discarded."""
     if operation == "root":
-        argv = ["git", "--no-optional-locks", "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        argv = ["git", "--no-optional-locks", "rev-parse", "--path-format=absolute",
+                "--git-common-dir", "--show-toplevel"]
     elif operation == "slug":
         argv = ["git", "--no-optional-locks", "remote", "get-url", "origin"]
+    elif operation == "launchd":
+        if not re.fullmatch(r"factory-[A-Za-z0-9_.-]+", unit):
+            raise _Unavailable("invalid_unit")
+        argv = ["launchctl", "print", f"gui/{os.getuid()}/{unit}"]
     elif operation in {"service", "timer", "schedule"}:
         if not re.fullmatch(r"factory-[A-Za-z0-9_.-]+", unit):
             raise _Unavailable("invalid_unit")
@@ -135,17 +141,21 @@ def _toml(path: Path) -> dict:
 def load(start: Path | None = None) -> Config:
     """Use the ordinary host/repo layering without its unbounded IO helpers."""
     try:
-        common = Path(_command("root", root=start).strip())
+        common, _, toplevel = _command("root", root=start).strip().partition("\n")
+        common, toplevel = Path(common), Path(toplevel)
         if not common.is_absolute():
             raise ValueError
-        root = common.parent
+        # A submodule's git dir is `.git/modules/<path>`: its checkout is the toplevel.
+        root = common.parent if common.name == ".git" else toplevel
+        if not root.is_absolute():
+            raise ValueError
         raw = _toml(root / config.CONFIG_NAME)
         slug = raw.get("repo", {}).get("slug")
         if not slug:
-            url = _command("slug", root=root).strip()
-            if "github.com" not in url:
+            match = config._GITHUB_SLUG.search(_command("slug", root=root).strip())
+            if match is None:
                 raise ValueError
-            slug = url.rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
+            slug = match[1]
         if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
             raise ValueError
         host = _toml(config.host_config_path())
@@ -255,26 +265,43 @@ def dispatcher(cfg: Config, executions: list[dict], history: dict) -> tuple[dict
             error("systemctl", kind, str(exc))
             return None
 
-    service_active, timer_active = active("service"), active("timer")
-    following = None
-    try:
-        rows = json.loads(_command("schedule", unit=cfg.unit))
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            raise ValueError
-        matches = [row for row in rows if row.get("unit") == f"{cfg.unit}.timer"]
-        if len(matches) > 1 or (not matches and timer_active is True):
-            raise ValueError
-        if matches:
-            value = matches[0].get("next")
-            if value is not None and (type(value) is not int or value < 0):
-                raise ValueError
-            if value not in (None, 0, 2**64 - 1):
-                following = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=value)
-    except _Unavailable as exc:
-        error("systemctl", "schedule", str(exc))
-    except (ValueError, TypeError, OverflowError, OSError, RecursionError):
-        error("systemctl", "schedule", "invalid_schedule")
+    def launchd() -> tuple[bool | None, bool | None]:
+        """macOS: the pass LaunchAgent. Loaded means scheduled; `state = running` means a pass runs."""
+        try:
+            text = _command("launchd", unit=cfg.unit)
+        except _Unavailable as exc:
+            # `launchctl print` fails for an agent that is not loaded (not installed or booted out).
+            error("launchctl", "service", "unit_unavailable" if str(exc) == "command_failed" else str(exc))
+            return None, None
+        state = re.search(r"^\tstate = (.+)$", text, re.MULTILINE)
+        if state is None:
+            error("launchctl", "service", "invalid_state")
+            return None, True
+        return state[1].strip() == "running", True
 
+    following = None
+    if shutil.which("systemctl") is None and shutil.which("launchctl") is not None:
+        # launchd exposes no next fire time for StartInterval jobs, so next_at stays null.
+        service_active, timer_active = launchd()
+    else:
+        service_active, timer_active = active("service"), active("timer")
+        try:
+            rows = json.loads(_command("schedule", unit=cfg.unit))
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError
+            matches = [row for row in rows if row.get("unit") == f"{cfg.unit}.timer"]
+            if len(matches) > 1 or (not matches and timer_active is True):
+                raise ValueError
+            if matches:
+                value = matches[0].get("next")
+                if value is not None and (type(value) is not int or value < 0):
+                    raise ValueError
+                if value not in (None, 0, 2**64 - 1):
+                    following = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=value)
+        except _Unavailable as exc:
+            error("systemctl", "schedule", str(exc))
+        except (ValueError, TypeError, OverflowError, OSError, RecursionError):
+            error("systemctl", "schedule", "invalid_schedule")
     active_count = None
     try:
         active_count = _capacity(cfg)

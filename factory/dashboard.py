@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -717,6 +718,8 @@ def metrics(tickets: list[dict], *, escape_tickets: set[int] | None = None) -> d
 
 
 def triage_llm_online() -> bool:
+    if cfg.triage_command:
+        return shutil.which(cfg.triage_command[0]) is not None  # hosted CLI: no endpoint to probe
     base = LLM_URL.rsplit("/chat/completions", 1)[0]
     try:
         with urllib.request.urlopen(f"{base}/models", timeout=1.5) as resp:
@@ -1249,7 +1252,7 @@ def snapshot() -> dict:
             },
             "approved_label": FACTORY_APPROVED,
             "triage": {
-                "url": LLM_URL,
+                "url": " ".join(cfg.triage_command) if cfg.triage_command else LLM_URL,
                 "model": LLM_MODEL,
                 "online": triage_llm_online(),
             },

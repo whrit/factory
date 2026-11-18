@@ -5332,7 +5332,7 @@ def _json_path(row: object, path: str) -> object:
 
 def _usage_local(usage: dict) -> bool:
     model = usage.get("model")
-    return (config.local_endpoint(cfg.llm_url)
+    return (not cfg.triage_command and config.local_endpoint(cfg.llm_url)
             and isinstance(model, str) and model == cfg.llm_model)
 
 

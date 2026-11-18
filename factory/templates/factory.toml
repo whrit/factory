@@ -181,6 +181,10 @@ exclusive = false
 # chat_template_kwargs = { enable_thinking = false }  # optional, passed through unchanged
 # Requests to the same URL queue across repositories/processes on this host user.
 # service = "my-model.service"  # opt in to a two-minute liveness timer installed by `factory install`
+# Or a hosted agent CLI instead of `url` (prompt on stdin, stdout is the answer); also
+# used by `watch`, `score` and `learn`. Usually set host-wide under [defaults.triage]:
+# command = ["claude", "-p", "--model", "haiku", "--tools", "", "--no-session-persistence"]
+# command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--color", "never", "-"]
 
 [journal]
 # .factory/events.jsonl rolls into events.jsonl.1.gz (older segments shift to

@@ -101,7 +101,7 @@ KNOWN_KEYS = {
     "eval": ("max_cases", "max_tokens", "budget_min", "profile", "schedule"),
     "gate": ("timeout", "lock", "check", "fixups", "protected_paths", "add_only_paths"),
     "leak_scan": ("pattern", "exclude", "extra"),
-    "triage": ("url", "model", "timeout", "service", "max_tokens", "chat_template_kwargs"),
+    "triage": ("url", "model", "timeout", "service", "max_tokens", "chat_template_kwargs", "command"),
     "journal": ("max_mb", "retention"),
     "dashboard": ("port", "theme"),
     "install": ("every", "dashboard", "host", "python", "env", "dispatch_env"),
@@ -261,6 +261,8 @@ class Config:
     triage_max_tokens: int = 2048
     triage_chat_template_kwargs: dict | None = None
     triage_service: str | None = None  # systemd user service restarted by the optional liveness probe
+    # Hosted CLI (Claude Code, Codex) answering the triage/judge prompt on stdin instead of `url`.
+    triage_command: list[str] | None = None
     manager_model: str | None = None  # dashboard's no-tools OMP briefing; never a command
     dashboard_port: int = 8765
     dashboard_theme: Path | None = None  # CSS file served after the built-in stylesheet
@@ -976,6 +978,18 @@ def load(start: Path | None = None, *, worktree: bool = False) -> Config:
         cfg.leak_pattern = "|".join(p for p in (cfg.leak_pattern, *terms) if p)
     cfg.llm_url = triage.get("url", cfg.llm_url)
     cfg.llm_model = triage.get("model", cfg.llm_model)
+    if "command" in triage:
+        command = triage["command"]
+        if isinstance(command, str):
+            try:
+                command = shlex.split(command)
+            except ValueError as exc:
+                raise ConfigError(f"triage.command: {exc}") from exc
+        if not isinstance(command, list) or not command or not all(isinstance(a, str) for a in command) or not command[0]:
+            raise ConfigError("triage.command must be a non-empty argv array or command string")
+        cfg.triage_command = command
+        if "model" not in triage:
+            cfg.llm_model = command_model(command) or Path(command[0]).name
     cfg.triage_timeout = int(triage.get("timeout", cfg.triage_timeout))
     max_tokens = triage.get("max_tokens", cfg.triage_max_tokens)
     if type(max_tokens) is not int or max_tokens < 1:

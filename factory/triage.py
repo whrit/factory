@@ -126,6 +126,9 @@ def _probe_paths(c: Config, endpoint: str) -> tuple[Path, Path]:
 
 def run_probe(c: Config, *, now: float | None = None) -> int:
     """Probe the model endpoint once, persisting failure and restart-cooldown state."""
+    if c.triage_command:
+        print(f"triage probe: skipped; [triage].command ({c.triage_command[0]}) has no endpoint to probe")
+        return 0
     endpoint = models_url(c)
     state_path, lock_path = _probe_paths(c, endpoint)
     c.factory.mkdir(parents=True, exist_ok=True)
@@ -374,7 +377,37 @@ class EndpointTimeout(SystemExit):
     """The model timed out on one request; the endpoint is up, so the pass can go on."""
 
 
+def _call_command(messages: list[dict], execution=None) -> _ModelReply:
+    """`[triage].command`: a hosted agent CLI gets the flattened chat on stdin; stdout is the reply."""
+    prompt = "\n\n".join(m["content"] for m in messages)
+    command = cfg.triage_command
+    try:
+        proc = subprocess.run(command, input=prompt, cwd=cfg.root, capture_output=True, text=True,
+                              timeout=cfg.triage_timeout, check=False)
+        reply = proc.stdout.strip()
+        failure = None if proc.returncode == 0 and reply else (
+            " ".join((proc.stderr.strip() or f"exit {proc.returncode} with no output").split())[-400:])
+    except subprocess.TimeoutExpired:
+        if execution:
+            execution.outcome, execution.reason = "unknown", "triage_endpoint_timeout"
+            execution.emit("result", timed_out=True, timeout_seconds=cfg.triage_timeout)
+        print(f"triage command {command[0]} timed out after {cfg.triage_timeout}s; raise [triage].timeout "
+              "if this persists.", file=sys.stderr)
+        raise EndpointTimeout(2) from None
+    except OSError as exc:
+        failure = str(exc)
+    if failure is not None:
+        if execution:
+            execution.outcome, execution.reason = "mechanism_failure", "triage_endpoint_unavailable"
+            execution.emit("result", timed_out=False, timeout_seconds=cfg.triage_timeout)
+        print(f"triage command {command[0]} failed: {failure}", file=sys.stderr)
+        raise SystemExit(2)
+    return _ModelReply(reply, None)
+
+
 def call_llm(messages: list[dict], execution=None) -> str:
+    if cfg.triage_command:
+        return _call_command(messages, execution)
     started = time.monotonic()
     body = {
         "model": LLM_MODEL,
@@ -412,6 +445,13 @@ def call_llm(messages: list[dict], execution=None) -> str:
             print(
                 f"local model request timed out after {cfg.triage_timeout}s {where} {LLM_URL}\n"
                 "The model server may be busy or the request too large; raise [triage].timeout if this persists.",
+                file=sys.stderr,
+            )
+        elif isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+            # The server answered, so it is running: OpenAI-compatible servers 404 an unknown model.
+            print(
+                f"local model server at {LLM_URL} has no model `{LLM_MODEL}` (HTTP 404)\n"
+                f"Pull it (Ollama: `ollama pull {LLM_MODEL}`) or set [triage].model to one it serves.",
                 file=sys.stderr,
             )
         else:

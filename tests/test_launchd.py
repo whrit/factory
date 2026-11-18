@@ -111,7 +111,7 @@ class InstallLaunchdTest(unittest.TestCase):
     def test_fresh_install_writes_and_loads_the_pass_agent(self) -> None:
         self.install()
         job = self.plist(self.cfg.unit)
-        self.assertEqual(job["StartInterval"], 600)
+        self.assertEqual((job["StartInterval"], job["RunAtLoad"]), (600, True))
         self.assertEqual(job["ProgramArguments"][:3], ["/bin/sh", "-c", onboard.PASS_SCRIPT])
         self.assertEqual(job["EnvironmentVariables"]["GH_CONFIG_DIR"], "/gh")
         self.assertEqual(job["WorkingDirectory"], str(self.root))
@@ -146,6 +146,59 @@ class InstallLaunchdTest(unittest.TestCase):
         self.assertEqual(self.plist(self.cfg.unit)["StartInterval"], 300)
         self.assertIn(["launchctl", "bootout", f"gui/{os.getuid()}/{self.cfg.unit}"], self.calls)
         self.assertIn(self.cfg.unit, self.loaded)
+
+
+class RuntimeLaunchdTest(unittest.TestCase):
+    """Runtime JSON reads the pass agent from `launchctl print` when systemd is absent."""
+
+    def observe(self, command) -> tuple[dict, list[dict]]:
+        from factory import runtime_local
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config.Config(Path(tmp), "acme/widgets", signoff=False)
+            with patch.object(runtime_local.shutil, "which",
+                              side_effect=lambda tool: "/bin/launchctl" if tool == "launchctl" else None), \
+                    patch.object(runtime_local, "_command", side_effect=command):
+                state, errors = runtime_local.dispatcher(cfg, [], {})
+        return state, [e for e in errors if e["source"] != "admission"]
+
+    def test_loaded_running_agent_is_active_without_systemctl_errors(self) -> None:
+        printed = "gui/501/factory-widgets = {\n\tactive count = 1\n\tstate = running\n\n\tendpoints = {\n\t\tstate = idle\n\t}\n}\n"
+        state, errors = self.observe(lambda operation, **kw: printed)
+        self.assertEqual((state["service_active"], state["timer_active"], state["next_at"]), (True, True, None))
+        self.assertEqual(errors, [])
+
+    def test_unloaded_agent_reports_unit_unavailable(self) -> None:
+        from factory import runtime_local
+
+        def fail(operation, **kw):
+            raise runtime_local._Unavailable("command_failed")
+
+        state, errors = self.observe(fail)
+        self.assertEqual((state["service_active"], state["timer_active"]), (None, None))
+        self.assertEqual(errors, [{"source": "launchctl", "scope": "service", "code": "unit_unavailable"}])
+
+
+class DashboardPortOwnerTest(unittest.TestCase):
+    def holder(self, agent_pid: str | None, listeners: str) -> str | None:
+        cfg = config.Config(Path("/tmp"), "acme/widgets", signoff=False)
+
+        def command(cmd, cwd=None):
+            if cmd[:2] == ["launchctl", "print"]:
+                out = f"{cmd[2]} = {{\n\tstate = running\n\tpid = {agent_pid}\n}}\n" if agent_pid else ""
+                return subprocess.CompletedProcess(cmd, 0 if agent_pid else 113, out, "")
+            self.assertEqual(cmd[:4], ["lsof", "-nP", "-iTCP:8765", "-sTCP:LISTEN"])
+            return subprocess.CompletedProcess(cmd, 0, listeners, "")
+
+        with patch.object(onboard, "sh", side_effect=command), \
+                patch.object(onboard.shutil, "which", return_value="/bin/launchctl"):
+            return onboard._launchd_dashboard_holder(cfg, 8765)
+
+    def test_only_our_dashboard_agent_owns_the_port(self) -> None:
+        self.assertEqual(self.holder("42", "42\n"), "owned by factory-widgets-dashboard (pid 42)")
+        self.assertIsNone(self.holder("42", "42\n77\n"))  # another listener shares it
+        self.assertIsNone(self.holder("42", "77\n"))
+        self.assertIsNone(self.holder(None, "77\n"))  # agent not loaded
 
 
 class WatchWithoutSystemdTest(unittest.TestCase):

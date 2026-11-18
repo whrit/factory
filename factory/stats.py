@@ -999,7 +999,7 @@ def main(argv: list[str]) -> int:
         journal_rows = window_rows(lifecycle.read_events(journal), start, now)
         rows = weekly_metrics(
             journal_rows, start, now,
-            cfg.llm_model if config.local_endpoint(cfg.llm_url) else None,
+            cfg.llm_model if config.local_endpoint(cfg.llm_url) and not cfg.triage_command else None,
         )
         rows.setdefault("skills", skill_metrics(journal_rows))
         rows.setdefault("skill_coverage", skill_coverage(journal_rows))

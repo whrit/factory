@@ -76,8 +76,8 @@ unit files are changed, rather than treating a query failure as a fresh install.
 **macOS.** Without `systemctl`, `factory install` writes LaunchAgents to
 `~/Library/LaunchAgents/factory-<repo>.plist` (plus `-dashboard` and, with an
 `[eval].schedule`, a weekly `-eval`) and loads them with `launchctl bootstrap
-gui/<uid>`. The pass agent runs the same sequence as the systemd unit every
-`--every` (a systemd time span such as `10min`): `drain-check` gates the pass,
+gui/<uid>`. The pass agent runs the same sequence as the systemd unit once at
+load and then every `--every` (a systemd time span such as `10min`): `drain-check` gates the pass,
 `triage` may fail, `dispatch` sets the result, and `watch` always runs with
 `SERVICE_RESULT`/`EXIT_STATUS` so a failed pass files itself. The dashboard
 agent restarts on failure. `[install].env` and the installing shell's `PATH`
@@ -88,7 +88,11 @@ existing agent that is disabled or not loaded stays paused unless `--enable`;
 a changed, loaded agent is reloaded. `--print` renders the plists.
 `[triage].service` names a systemd unit, so the triage probe agent is skipped.
 LaunchAgents run only while you are logged in; a pass missed during sleep runs
-on wake. `doctor` reports `launchd agent factory-<repo>: loaded`.
+on wake. `doctor` reports `launchd agent factory-<repo>: loaded`. The runtime
+projection reads that agent with one `launchctl print gui/<uid>/factory-<repo>`
+(source `launchctl`, scope `service`): loaded is `timer_active: true`, `state =
+running` is `service_active: true`, and `next_at` stays null because launchd
+exposes no next fire time.
 
 `doctor` checks the configured dashboard bind address and port; `install --dashboard`
 refuses a foreign or unidentified holder before writing units. Each factory needs
@@ -1558,6 +1562,24 @@ chat_template_kwargs = { enable_thinking = false }
 District merges that host override into the remote `[defaults.triage]`; Factory
 also accepts `[repo."owner/name".triage]` overrides. Keep these settings out of
 the repository file when hosts need different request shapes.
+
+**Hosted triage (no local model).** `[triage].command` replaces the HTTP
+endpoint with a hosted agent CLI. Factory flattens the chat into one prompt on
+stdin and takes stdout as the answer, for triage and for every other caller of
+the triage model (`watch` diagnosis, `score` compliance, `learn` without a
+manager command). A nonzero exit or empty output is `triage_endpoint_unavailable`
+(stderr is printed); exceeding `timeout` is `triage_endpoint_timeout`, so the
+dispatch pass still runs. `model` defaults to the command's `--model` value, else
+the program name. No token usage is journaled, `doctor` checks only that the
+program is on `PATH` (it never spends a call), and `triage-probe` is skipped.
+Keep the CLI tool-less or read-only, since issue text is untrusted:
+
+```toml
+[defaults.triage]   # host config: every repository on this machine
+command = ["claude", "-p", "--model", "haiku", "--tools", "", "--no-session-persistence"]
+# command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--color", "never", "-"]
+timeout = 180
+```
 
 The shared host file is `$XDG_CONFIG_HOME/factory/config.toml` (default
 `~/.config/factory/config.toml`). `[defaults.engine]` belongs to District:
